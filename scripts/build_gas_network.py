@@ -32,6 +32,8 @@ Description
 
 """
 import geoplot
+import geopy
+from geopy.distance import lonlat
 import geoplot.crs as gcrs
 import matplotlib.pyplot as plt
 
@@ -72,20 +74,31 @@ def string2list(string, with_None=True):
 #-----------------#
 def preprocessing(df_path):
     """Load  and format gas network data."""
-    df = pd.read_csv(df_path, sep=',')
+    df = pd.read_csv(df_path, sep=';')
+    #+ long +++ lat +++ node_id +++ is_bothDirection +++
+    df.long = df.long.apply(eval)
+    df.lat = df.lat.apply(eval)
+    df.node_id = df.node_id.apply(eval)
 
-    df.long = df.long.apply(string2list)
-    df.lat = df.lat.apply(string2list)
-    df.node_id = df.node_id.apply(string2list)
+    # resgin id of each pipe
+    df['id'] = ['INETNO_PIPE_'+str(i) for i in range(len(df))]
 
-    # pipes which can be used in both directions
-    both_direct_df = df[df.is_bothDirection == 1].reset_index(drop=True)
-    both_direct_df.node_id = both_direct_df.node_id.apply(lambda x: [x[1], x[0]])
-    both_direct_df.long = both_direct_df.long.apply(lambda x: [x[1], x[0]])
-    both_direct_df.lat = both_direct_df.lat.apply(lambda x: [x[1], x[0]])
+    #TODO if we still keep is_bothDirection in final result, i think we don't need these anymore
+    # pipes which can be used in both directions (split each both direction pipe into two single direction pipes)
 
-    df_singledirect = pd.concat([df, both_direct_df]).reset_index(drop=True)
-    df_singledirect.drop('is_bothDirection', axis=1)
+    #-------------------------delete in future------------------------------
+    # both_direct_df = df[df.is_bothDirection == 1].reset_index(drop=True)
+    # # reverse node_id order
+    # both_direct_df.node_id = both_direct_df.node_id.apply(lambda x: [x[1], x[0]])
+    # # reverse coordinate order
+    # both_direct_df.long = both_direct_df.long.apply(lambda x: [x[1], x[0]])
+    # both_direct_df.lat = both_direct_df.lat.apply(lambda x: [x[1], x[0]])
+    #
+    # # add reverse pipe in dataframe
+    # df_singledirect = pd.concat([df, both_direct_df]).reset_index(drop=True)
+    # # remove direction column
+    # df_singledirect.drop('is_bothDirection', axis=1)
+    #------------------------------------------------------------------------
 
     # create shapely geometry points
     df['point1'] = df.apply(lambda x: Point((x['long'][0], x['lat'][0])), axis=1)
@@ -94,6 +107,28 @@ def preprocessing(df_path):
     df['point2_name'] = df.node_id.str[1]
 
 
+    part1 = df[['point1', 'point1_name']]
+    part2 = df[['point2', 'point2_name']]
+    part1.columns = ['geometry', 'name']
+    part2.columns = ['geometry', 'name']
+    points = [part1, part2]
+    points = concat_gdf(points)
+    points = points.drop_duplicates()
+    points.reset_index(drop=True, inplace=True)
+
+    # solve point name not unique problem, give each point a new node id
+    points['key'] = points['geometry'].apply(lambda x: str(list(x.coords)[0]))
+    points['name'] = ['INETNO_' + str(i) for i in range(len(points))]
+    points = points.groupby('key').first()
+
+    df['node_id'] = df.apply(lambda x: [points.loc[str(list(x['point1'].coords)[0]), 'name'],
+                                        points.loc[str(list(x['point2'].coords)[0]), 'name']],
+                                        axis=1)
+
+    df['point1_name'] = df.node_id.str[0]
+    df['point2_name'] = df.node_id.str[1]
+
+    #re create points again with new point name
     part1 = df[['point1', 'point1_name']]
     part2 = df[['point2', 'point2_name']]
     part1.columns = ['geometry', 'name']
@@ -113,7 +148,7 @@ def load_region(onshore_path, offshore_path):
     buses_region = concat_gdf([buses_region_offshore, buses_region_onshore])
     buses_region = buses_region.dissolve(by='name', aggfunc='sum')
     buses_region = buses_region.reset_index()
-
+    print(len(buses_region))
     return buses_region
 
 
@@ -121,7 +156,7 @@ def create_points2buses_map(input_points, buses_region):
     """Map gas network points to network buses depending on bus region."""
     points = input_points.copy()
     points['bus'] = None
-    buses_list = set(buses_region.name)
+    buses_list = sorted(list(set(buses_region.name))) # must sorted, otherwise will case problem
     for bus in buses_list:
         mask = buses_region[buses_region.name == bus]
         index = gpd.clip(points, mask).index
@@ -142,13 +177,13 @@ def create_cross_regions_network(df, points2buses_map):
                                   (pd.DataFrame)
     """
     tmp_df = points2buses_map[['bus', 'name']]
-    tmp_df.columns = ['buses_start','name']
+    tmp_df.columns = ['buses_start','point1_name']
     cross_buses_gas_network = df.merge(tmp_df, left_on='point1_name',
-                                       right_on='name')
-    tmp_df.columns = ['buses_destination', 'name']
+                                       right_on='point1_name')
+    tmp_df.columns = ['buses_destination', 'point2_name']
     cross_buses_gas_network = cross_buses_gas_network.merge(tmp_df,
                                                             left_on='point2_name',
-                                                            right_on='name')
+                                                            right_on='point2_name')
     # drop all pipes connecting the same bus
     cross_buses_gas_network = cross_buses_gas_network[cross_buses_gas_network.buses_start \
                                                       != cross_buses_gas_network.buses_destination]
@@ -176,7 +211,7 @@ def clean_dataset(cross_buses_gas_network):
     """Convert units and save only necessary data."""
     inspect_pipe_capacity(cross_buses_gas_network)
     cols = ['is_bothDirection', 'capacity_recalculated','buses_start',
-            'buses_destination', 'id', 'length_km']
+            'buses_destination', 'id', 'distance']
     clean_pipes = cross_buses_gas_network[cols].dropna()
 
 
@@ -189,32 +224,35 @@ def clean_dataset(cross_buses_gas_network):
     return clean_pipes
 
 
-def recalculate_pipe_capacity(pipe_diameter_mm):
-    """Calculate pipe capacity based on diameter.
 
-    20 inch (500 mm)  50 bar -> 1.5   GW CH4 pipe capacity (LHV)
-    24 inch (600 mm)  50 bar -> 5     GW CH4 pipe capacity (LHV)
-    36 inch (900 mm)  50 bar -> 11.25 GW CH4 pipe capacity (LHV)
-    48 inch (1200 mm) 80 bar -> 21.7  GW CH4 pipe capacity (LHV)
 
-    Based on p.15 of (https://gasforclimate2050.eu/wp-content/uploads/2020/07/2020_European-Hydrogen-Backbone_Report.pdf"""
-    # slope
-    m0 = (5-1.5) / (600-500)
-    m1 = (11.25-5)/(900-600)
-    m2 = (21.7-11.25)/(1200-900)
+def simple_distance(buses_region,cross_buses_gas_network):
+    # calculate center coordinate
+    buses_region['center'] = buses_region.to_crs('EPSG:3857').centroid.to_crs('EPSG:4326')
+    buses_region['center'] = buses_region['center'].apply(lambda x: list(x.coords)[0])
 
-    if pipe_diameter_mm<500:
-        return np.nan
-    if pipe_diameter_mm<600 and pipe_diameter_mm>=500:
-        return -16 + m0 * pipe_diameter_mm
-    if pipe_diameter_mm<900 and pipe_diameter_mm>=600:
-        return -7.5 + m1 * pipe_diameter_mm
-    else:
-        return -20.1 + m2 * pipe_diameter_mm
+    data = {'buses_start': [], 'buses_start_center': [], 'buses_destination': [], 'buses_destination_center': [],
+            'distance': []}
+    for i in range(len(buses_region)):
+        for j in range(len(buses_region)):
+            if i == j:
+                continue
+            data['buses_start'].append(buses_region.loc[i, 'name'])
+            data['buses_start_center'].append(buses_region.loc[i, 'center'])
+
+            data['buses_destination'].append(buses_region.loc[j, 'name'])
+            data['buses_destination_center'].append(buses_region.loc[j, 'center'])
+
+            data['distance'].append(geopy.distance.distance(lonlat(*buses_region.loc[i, 'center']),
+                                                            lonlat(*buses_region.loc[j, 'center'])).kilometers)
+    df = pd.DataFrame(data)
+    return cross_buses_gas_network.merge(df, left_on=['buses_start', 'buses_destination'],
+                            right_on=['buses_start', 'buses_destination'])
 
 def inspect_pipe_capacity(gas_network):
     """Check pipe capacity depending on diameter and pressure."""
-    gas_network["capacity_recalculated"] = gas_network.diameter_mm.apply(recalculate_pipe_capacity)
+    #TODO since we already use recalculation function in dataset generation, Capacity_GWh_h is the capacity we want
+    gas_network["capacity_recalculated"] = gas_network['Capacity_GWh_h']
     low_cap = gas_network.Capacity_GWh_h < 1.5
     # if pipe capacity smaller than 1.5 GW take original pipe capacity
     gas_network.loc[low_cap, "capacity_recalculated"] = gas_network.loc[low_cap, "capacity_recalculated"].fillna(gas_network.loc[low_cap,"Capacity_GWh_h"])
@@ -283,6 +321,7 @@ if __name__ == "__main__":
     cross_buses_gas_network = create_cross_regions_network(gas_network,
                                                            points2buses_map)
 
+    cross_buses_gas_network = simple_distance(buses_region,cross_buses_gas_network)
     # view(cross_buses_gas_network, buses_region, snakemake.input.country_shapes)
 
     # check which buses are not connected in gas network
@@ -290,4 +329,5 @@ if __name__ == "__main__":
 
     # convert units and save only needed data
     gas_pipes = clean_dataset(cross_buses_gas_network)
+
     gas_pipes.to_csv(snakemake.output.clustered_gas_network)

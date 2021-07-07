@@ -3,6 +3,7 @@
 __pycache__
 gurobi.log
 .vscode
+*.DS_Store
 
 /bak
 /resources*
